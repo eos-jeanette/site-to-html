@@ -122,3 +122,19 @@ button:disabled {
   color: var(--muted);
   font-size: 0.8rem;
 }
+
+button.secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+@media (max-width: 560px) {
+  form {
+    flex-wrap: wrap;
+  }
+
+  input[type="text"] {
+    flex-basis: 100%;
+  }
+}

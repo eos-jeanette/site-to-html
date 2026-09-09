@@ -69,13 +69,12 @@ export default function Home() {
 
   function downloadBrandKit() {
     return run<FetchBrandKitResponse>("brandkit", "/api/fetch-brandkit", (kit) => {
-      const derived = countDerived(kit);
       return {
         blob: new Blob([JSON.stringify(kit, null, 2)], { type: "application/json;charset=utf-8" }),
         filename: stampedFilename(kit.sourceUrl, "brandkit.json"),
         summary:
           `${kit.colorScheme} scheme, ${kit.fonts.length} font${kit.fonts.length === 1 ? "" : "s"}, ` +
-          `${derived.found} of ${derived.total} colour slots derived.`,
+          `primary ${kit.colors.primary}, accent ${kit.colors.accent}.`,
       };
     });
   }
@@ -134,12 +133,6 @@ export default function Home() {
       </p>
     </main>
   );
-}
-
-/** How many of the six colour slots came back with a value — a rough quality signal. */
-function countDerived(kit: FetchBrandKitResponse): { found: number; total: number } {
-  const slots = Object.values(kit.colors);
-  return { found: slots.filter(Boolean).length, total: slots.length };
 }
 
 /**

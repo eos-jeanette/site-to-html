@@ -35,7 +35,17 @@ export function parseColor(input: string): Rgb | null {
   if (value.startsWith("rgb")) return parseNumeric(value, "rgb");
   if (value.startsWith("hsl")) return parseNumeric(value, "hsl");
   if (value.startsWith("oklch")) return parseOklch(value);
+  if (value.startsWith("oklab")) return parseLab(value, "oklab");
+  if (value.startsWith("lab")) return parseLab(value, "lab");
   return null;
+}
+
+/** Split `fn(a b c / alpha)` or `fn(a, b, c, alpha)` into its numeric parts. */
+function functionParts(value: string): string[] | null {
+  const open = value.indexOf("(");
+  if (open === -1 || !value.endsWith(")")) return null;
+  const parts = value.slice(open + 1, -1).replace(/\//g, " ").split(/[\s,]+/).filter(Boolean);
+  return parts.length >= 3 ? parts : null;
 }
 
 function parseHex(value: string): Rgb | null {
@@ -86,10 +96,8 @@ function parseNumeric(value: string, kind: "rgb" | "hsl"): Rgb | null {
 
 /** oklch() is common in modern design systems, so it's worth converting properly. */
 function parseOklch(value: string): Rgb | null {
-  const open = value.indexOf("(");
-  if (open === -1 || !value.endsWith(")")) return null;
-  const parts = value.slice(open + 1, -1).replace(/\//g, " ").split(/[\s,]+/).filter(Boolean);
-  if (parts.length < 3) return null;
+  const parts = functionParts(value);
+  if (!parts) return null;
 
   const L = parts[0].endsWith("%") ? Number.parseFloat(parts[0]) / 100 : Number.parseFloat(parts[0]);
   const C = parts[1].endsWith("%") ? (Number.parseFloat(parts[1]) / 100) * 0.4 : Number.parseFloat(parts[1]);
@@ -97,23 +105,60 @@ function parseOklch(value: string): Rgb | null {
   if ([L, C, hDeg].some(Number.isNaN)) return null;
   const alpha = parts.length > 3 ? toAlpha(parts[3]) : 1;
 
+  // Polar oklch -> cartesian oklab, then the shared oklab conversion.
   const h = (hDeg * Math.PI) / 180;
-  const a = C * Math.cos(h);
-  const bb = C * Math.sin(h);
+  return { ...oklabToSrgb(L, C * Math.cos(h), C * Math.sin(h)), a: alpha };
+}
 
-  const l_ = (L + 0.3963377774 * a + 0.2158037573 * bb) ** 3;
-  const m_ = (L - 0.1055613458 * a - 0.0638541728 * bb) ** 3;
-  const s_ = (L - 0.0894841775 * a - 1.291485548 * bb) ** 3;
+/**
+ * CIE Lab (D50, as CSS specifies) and Oklab. Both appear in modern stylesheets —
+ * notably in `@supports` blocks that restate a palette in a wider gamut.
+ */
+function parseLab(value: string, kind: "lab" | "oklab"): Rgb | null {
+  const parts = functionParts(value);
+  if (!parts) return null;
 
-  const lr = 4.0767416621 * l_ - 3.3077115913 * m_ + 0.2309699292 * s_;
-  const lg = -1.2684380046 * l_ + 2.6097574011 * m_ - 0.3413193965 * s_;
-  const lb = -0.0041960863 * l_ - 0.7034186147 * m_ + 1.707614701 * s_;
+  const maxL = kind === "lab" ? 100 : 1;
+  const L = parts[0].endsWith("%") ? (Number.parseFloat(parts[0]) / 100) * maxL : Number.parseFloat(parts[0]);
+  const aScale = kind === "lab" ? 125 : 0.4;
+  const a = parts[1].endsWith("%") ? (Number.parseFloat(parts[1]) / 100) * aScale : Number.parseFloat(parts[1]);
+  const b = parts[2].endsWith("%") ? (Number.parseFloat(parts[2]) / 100) * aScale : Number.parseFloat(parts[2]);
+  if ([L, a, b].some(Number.isNaN)) return null;
+  const alpha = parts.length > 3 ? toAlpha(parts[3]) : 1;
 
-  const toSrgb = (c: number) => {
-    const v = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.abs(c) ** (1 / 2.4) - 0.055;
-    return clamp(Math.round(v * 255), 0, 255);
+  if (kind === "oklab") return { ...oklabToSrgb(L, a, b), a: alpha };
+
+  // CIE Lab -> XYZ (D50) -> linear sRGB (Bradford-adapted D50->D65 matrix).
+  const fy = (L + 16) / 116;
+  const fx = fy + a / 500;
+  const fz = fy - b / 200;
+  const invert = (t: number) => (t ** 3 > 0.008856 ? t ** 3 : (t - 16 / 116) / 7.787);
+  const x = invert(fx) * 0.9642;
+  const y = invert(fy) * 1.0;
+  const z = invert(fz) * 0.8249;
+
+  const lr = 3.1338561 * x - 1.6168667 * y - 0.4906146 * z;
+  const lg = -0.9787684 * x + 1.9161415 * y + 0.033454 * z;
+  const lb = 0.0719453 * x - 0.2289914 * y + 1.4052427 * z;
+  return { r: gammaEncode(lr), g: gammaEncode(lg), b: gammaEncode(lb), a: alpha };
+}
+
+function oklabToSrgb(L: number, a: number, b: number): { r: number; g: number; b: number } {
+  const l_ = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m_ = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s_ = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
+
+  return {
+    r: gammaEncode(4.0767416621 * l_ - 3.3077115913 * m_ + 0.2309699292 * s_),
+    g: gammaEncode(-1.2684380046 * l_ + 2.6097574011 * m_ - 0.3413193965 * s_),
+    b: gammaEncode(-0.0041960863 * l_ - 0.7034186147 * m_ + 1.707614701 * s_),
   };
-  return { r: toSrgb(lr), g: toSrgb(lg), b: toSrgb(lb), a: alpha };
+}
+
+/** Linear-light channel to an 8-bit sRGB value. */
+function gammaEncode(c: number): number {
+  const v = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.abs(c) ** (1 / 2.4) - 0.055;
+  return clamp(Math.round(v * 255), 0, 255);
 }
 
 function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: number } {

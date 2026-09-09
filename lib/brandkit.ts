@@ -5,24 +5,28 @@ import { normalizeColor, parseColor, relativeLuminance } from "@/lib/color";
 import type { PageBundle } from "@/lib/page";
 import { resolveHref } from "@/lib/url";
 
+/** Every field has a concrete value — an undetectable one falls back to a CSS initial. */
 export type ButtonStyle = {
-  background: string | null;
-  textColor: string | null;
-  borderColor: string | null;
-  borderRadius: string | null;
-  shadow: string | null;
+  background: string;
+  textColor: string;
+  borderColor: string;
+  borderRadius: string;
+  shadow: string;
 };
 
 export type BrandKit = {
   colorScheme: "light" | "dark";
   fonts: { family: string; role: "body" | "heading" }[];
+  /** Never null: an underivable slot falls back to the theme default (see FALLBACK_*). */
   colors: {
-    primary: string | null;
-    secondary: string | null;
-    accent: string | null;
-    background: string | null;
-    textPrimary: string | null;
-    link: string | null;
+    primary: string;
+    secondary: string;
+    tertiary: string;
+    accent: string;
+    background: string;
+    textPrimary: string;
+    textSecondary: string;
+    link: string;
   };
   typography: {
     fontFamilies: { primary: string | null; heading: string | null };
@@ -30,7 +34,7 @@ export type BrandKit = {
     fontSizes: { h1: string | null; h2: string | null; body: string | null };
   };
   spacing: { baseUnit: number; borderRadius: string | null };
-  components: { buttonPrimary: ButtonStyle | null; buttonSecondary: ButtonStyle | null };
+  components: { buttonPrimary: ButtonStyle; buttonSecondary: ButtonStyle };
   images: {
     logo: string | null;
     favicon: string | null;
@@ -52,6 +56,20 @@ type StyleRule = {
 const INTERACTIVE = /:(hover|focus|focus-within|focus-visible|active|visited|target|disabled|checked)\b/;
 const BUTTON_CLASS = /(^|[-_\s])(btn|button|cta)/i;
 const BRANDY_CLASS = /(^|[-_\s.])(btn|button|cta|primary|accent|secondary)/i;
+/** Classes that mark an element as ordinary navigation rather than a call to action. */
+const NAV_LINK_CLASS = /(^|[-_\s])(nav|menu)[-_]?(link|item|entry)|(^|[-_\s])(menu|nav)(link|item)/i;
+const ICON_SELECTOR = /(^|[\s>+~,.#])(svg|i)\b|icon|glyph|\bfa-/i;
+const HERO_CLASS = /(^|[-_\s])(hero|banner|jumbotron|masthead|splash|intro)/i;
+const NAVBAR_CLASS = /(^|[-_\s])(nav|navbar|header|topbar|masthead)/i;
+
+/** Theme neutrals used wherever a colour can't be derived. */
+const FALLBACK_LIGHT = "#ffffff";
+const FALLBACK_DARK = "#000000";
+
+/** CSS initial values, used so component fields are never null. */
+const DEFAULT_BUTTON_BORDER = "transparent";
+const DEFAULT_BUTTON_RADIUS = "0px";
+const DEFAULT_BUTTON_SHADOW = "none";
 
 /**
  * Derive a brand kit from a fetched page using pure code heuristics — selector
@@ -61,7 +79,7 @@ const BRANDY_CLASS = /(^|[-_\s.])(btn|button|cta|primary|accent|secondary)/i;
 export function deriveBrandKit(bundle: PageBundle): BrandKit {
   const $ = cheerio.load(bundle.html);
   const { rules, atRuleVars } = collectRules(bundle);
-  const variables = collectVariables(rules, atRuleVars);
+  const variables = collectVariables($, rules, atRuleVars);
   for (const rule of rules) {
     for (const [prop, value] of rule.decls) rule.decls.set(prop, resolveVars(value, variables));
   }
@@ -75,14 +93,24 @@ export function deriveBrandKit(bundle: PageBundle): BrandKit {
   const { fonts, headingStack, bodyStack } = collectFonts(rules, $, bodyStyle);
   const buttons = findButtonElements($);
 
+  const colorScheme = classifyScheme(background);
+  // No colour slot is ever null: what can't be derived falls back to the theme's
+  // neutral — white on a light page, black on a dark one.
+  const fallback = colorScheme === "dark" ? FALLBACK_DARK : FALLBACK_LIGHT;
+  const ranked = rankButtonColors(rules, $, buttons);
+
   return {
-    colorScheme: classifyScheme(background),
+    colorScheme,
     fonts,
     colors: {
-      ...deriveBrandColors(rules, $, buttons),
-      background,
-      textPrimary: firstColor(bodyStyle, ["color"]),
-      link: deriveLinkColor($, rules),
+      primary: ranked[0] ?? fallback,
+      secondary: ranked[1] ?? fallback,
+      tertiary: deriveTertiary(rules, $, ranked.slice(0, 2)) ?? fallback,
+      accent: deriveAccent($, rules, background) ?? fallback,
+      background: background ?? fallback,
+      textPrimary: textColorOf($, rules, firstNonEmpty($, "p")) ?? firstColor(bodyStyle, ["color"]) ?? fallback,
+      textSecondary: textColorOf($, rules, firstNonEmpty($, "h2, h3, h4, h5, h6")) ?? fallback,
+      link: deriveLinkColor($, rules) ?? fallback,
     },
     typography: {
       fontFamilies: { primary: bodyStack[0] ?? null, heading: headingStack[0] ?? null },
@@ -96,7 +124,7 @@ export function deriveBrandKit(bundle: PageBundle): BrandKit {
       baseUnit: 4,
       borderRadius: deriveBorderRadius(rules, $, buttons),
     },
-    components: deriveComponents($, rules, buttons),
+    components: deriveComponents($, rules, buttons, fallback),
     images: deriveImages($, bundle.url),
     brandName: deriveBrandName($),
   };
@@ -142,7 +170,9 @@ function collectRules(bundle: PageBundle): { rules: StyleRule[]; atRuleVars: Map
       rules.push({
         selectors: rule.selectors.map((selector) => selector.trim()).filter(Boolean),
         decls,
-        conditional: hasAncestorAtRule(rule, /media|supports|container|layer/),
+        // @layer is deliberately not conditional: it always applies and only affects
+        // cascade order, unlike @media/@supports which may not apply at all.
+        conditional: hasAncestorAtRule(rule, /media|supports|container/),
       });
     });
   }
@@ -162,16 +192,66 @@ function hasAncestorAtRule(rule: Rule, pattern: RegExp): boolean {
   return false;
 }
 
-/** Custom properties, so var() references in colour and font values can be resolved. */
-function collectVariables(rules: StyleRule[], atRuleVars: Map<string, string>): Map<string, string> {
-  // At-rule tokens seed the pool; a :root/html/body declaration overrides them.
+/**
+ * Custom properties, so var() references in colour and font values can be resolved.
+ *
+ * A token is routinely declared several times, and picking the wrong declaration
+ * silently yields the wrong palette, so definitions are ranked by how strong the
+ * evidence is that they are the ones in effect:
+ *
+ *  - activeScope: the selector matches this document's own <html>/<body>, so it is
+ *    demonstrably applied — a site shipping `[data-theme=dark]` alongside
+ *    `[data-theme=light]` tells us which one it renders with.
+ *  - global: declared on :root/html/body unconditionally.
+ *  - conditionalGlobal: the same, but inside @media/@supports. Commonly a wider-gamut
+ *    restatement of a palette that must not displace the base value.
+ *  - inactiveScope: some other component or theme scope — a last resort, and there the
+ *    first definition wins, since later ones are alternative themes, not overrides.
+ */
+const VAR_RANK = { inactiveScope: 0, conditionalGlobal: 1, global: 2, activeScope: 3 } as const;
+
+function collectVariables(
+  $: cheerio.CheerioAPI,
+  rules: StyleRule[],
+  atRuleVars: Map<string, string>,
+): Map<string, string> {
   const variables = new Map<string, string>(atRuleVars);
+  // At-rule tokens (Tailwind's @theme) seed the pool below every rule-based definition.
+  const ranks = new Map<string, number>([...atRuleVars.keys()].map((name) => [name, -1]));
+
+  const roots = [$("html").first(), $("body").first()].filter((element) => element.length > 0);
+  const isActiveScope = (selectors: string[]) =>
+    selectors.some((selector) => {
+      const usable = sanitizeSelector(selector);
+      if (!usable) return false;
+      try {
+        return roots.some((element) => element.is(usable));
+      } catch {
+        return false;
+      }
+    });
+
   for (const rule of rules) {
     const global = rule.selectors.some((selector) => /^(:root|html|body|\*)$/i.test(selector.trim()));
+    const rank = global
+      ? rule.conditional
+        ? VAR_RANK.conditionalGlobal
+        : VAR_RANK.global
+      : isActiveScope(rule.selectors)
+        ? VAR_RANK.activeScope
+        : VAR_RANK.inactiveScope;
+
     for (const [prop, value] of rule.decls) {
       if (!prop.startsWith("--")) continue;
-      // Globals win; a scoped definition is only a fallback for an otherwise unknown name.
-      if (global || !variables.has(prop)) variables.set(prop, value);
+      const previous = ranks.get(prop);
+      if (previous !== undefined) {
+        if (rank < previous) continue;
+        // Among inactive theme scopes the first definition stands; later ones are
+        // sibling themes (light/glass/dark), not overrides of each other.
+        if (rank === previous && rank === VAR_RANK.inactiveScope) continue;
+      }
+      variables.set(prop, value);
+      ranks.set(prop, rank);
     }
   }
   return variables;
@@ -451,11 +531,11 @@ function findButtonElements($: cheerio.CheerioAPI): cheerio.Cheerio<AnyNode>[] {
  * then "accent". Nothing here knows which colour a designer would call the brand colour —
  * only which one is repeated most often across buttons and CTAs.
  */
-function deriveBrandColors(
+function rankButtonColors(
   rules: StyleRule[],
   $: cheerio.CheerioAPI,
   buttons: cheerio.Cheerio<AnyNode>[],
-): { primary: string | null; secondary: string | null; accent: string | null } {
+): string[] {
   const counts = new Map<string, number>();
   const bump = (color: string | null) => {
     if (!isVisibleColor(color)) return;
@@ -472,8 +552,145 @@ function deriveBrandColors(
     bump(firstColor(computeStyle($, button, rules), ["background-color", "background"]));
   }
 
-  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([color]) => color);
-  return { primary: ranked[0] ?? null, secondary: ranked[1] ?? null, accent: ranked[2] ?? null };
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([color]) => color);
+}
+
+/**
+ * A third brand colour drawn from icons and button hover states — the places a palette
+ * tends to show a colour that never appears as a resting button background. Ranked by
+ * frequency, and only accepted if it differs from primary and secondary.
+ */
+function deriveTertiary(
+  rules: StyleRule[],
+  $: cheerio.CheerioAPI,
+  taken: string[],
+): string | null {
+  const counts = new Map<string, number>();
+  const bump = (color: string | null) => {
+    if (!isVisibleColor(color) || taken.includes(color)) return;
+    counts.set(color, (counts.get(color) ?? 0) + 1);
+  };
+
+  for (const rule of rules) {
+    const usable = rule.selectors.filter((selector) => !selector.includes("::"));
+    if (usable.length === 0) continue;
+
+    // Hover styling on a button: the colour it changes to.
+    if (usable.some((selector) => /:hover\b/.test(selector) && isButtonSelector(selector))) {
+      bump(firstColor(rule.decls, ["background-color", "background"]));
+      bump(firstColor(rule.decls, ["color"]));
+    }
+
+    // Icon styling: fill/stroke carry the colour far more often than `color` does.
+    if (usable.some((selector) => ICON_SELECTOR.test(selector))) {
+      bump(firstColor(rule.decls, ["fill", "stroke", "color"]));
+    }
+  }
+
+  // Icons drawn inline carry their colour as an attribute rather than a declaration.
+  $("svg, svg *").each((_, el) => {
+    for (const attribute of ["fill", "stroke"]) {
+      const value = $(el).attr(attribute);
+      if (!value || /^(none|currentcolor|inherit)$/i.test(value)) continue;
+      bump(normalizeColor(value));
+    }
+  });
+
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+}
+
+/**
+ * The call-to-action colour: the background of a button in the navbar that isn't part
+ * of the navigation (a "Sign up" / "Get started"), falling back to the first button in
+ * the hero section.
+ *
+ * What separates a CTA from a menu entry is that it's filled: nav links are bare text,
+ * while the CTA carries its own background. So candidacy is decided by the computed
+ * background rather than by class naming — sites style anchors as buttons with utility
+ * classes that contain no hint of the word "button".
+ */
+function deriveAccent(
+  $: cheerio.CheerioAPI,
+  rules: StyleRule[],
+  pageBackground: string | null,
+): string | null {
+  for (const candidates of [navbarCtaButtons($), heroButtons($)]) {
+    for (const element of candidates) {
+      const background = firstColor(computeStyle($, element, rules), ["background-color", "background"]);
+      if (!isVisibleColor(background)) continue;
+      // Matching the page background means it isn't filled — it just sits on the page.
+      if (pageBackground && background === pageBackground) continue;
+      return background;
+    }
+  }
+  return null;
+}
+
+const CLICKABLE = "button, a, [role='button'], input[type='submit'], input[type='button']";
+
+/** Clickable elements in the header/nav, minus the ones that are plainly menu entries. */
+function navbarCtaButtons($: cheerio.CheerioAPI): cheerio.Cheerio<AnyNode>[] {
+  const bars = $("nav, header, [role='navigation']").add(
+    $("[class]").filter((_, el) => NAVBAR_CLASS.test($(el).attr("class") ?? "")),
+  );
+
+  const found: cheerio.Cheerio<AnyNode>[] = [];
+  const seen = new Set<AnyNode>();
+
+  bars.each((_, bar) => {
+    $(bar)
+      .find(CLICKABLE)
+      .each((__, el) => {
+        const element = $(el);
+        if (seen.has(el)) return; // nested nav/header elements overlap
+        // A class that names itself a menu entry is navigation, whatever it looks like.
+        if (NAV_LINK_CLASS.test(element.attr("class") ?? "")) return;
+        seen.add(el);
+        found.push(element);
+      });
+  });
+  return found;
+}
+
+/** Clickable elements inside the hero: an explicitly hero-classed block, else the h1's container. */
+function heroButtons($: cheerio.CheerioAPI): cheerio.Cheerio<AnyNode>[] {
+  let hero: cheerio.Cheerio<AnyNode> = $("[class]")
+    .filter((_, el) => HERO_CLASS.test($(el).attr("class") ?? ""))
+    .first();
+
+  if (hero.length === 0) {
+    const h1 = $("h1").first();
+    if (h1.length > 0) hero = h1.closest("section, header, div");
+  }
+  if (hero.length === 0) return [];
+
+  const found: cheerio.Cheerio<AnyNode>[] = [];
+  hero.find(CLICKABLE).each((_, el) => {
+    found.push($(el));
+  });
+  return found;
+}
+
+/** First element matching the selector that actually has visible text. */
+function firstNonEmpty($: cheerio.CheerioAPI, selector: string): cheerio.Cheerio<AnyNode> | null {
+  const matched = $(selector).filter((_, el) => $(el).text().trim().length > 0);
+  return matched.length > 0 ? matched.first() : null;
+}
+
+function textColorOf(
+  $: cheerio.CheerioAPI,
+  rules: StyleRule[],
+  element: cheerio.Cheerio<AnyNode> | null,
+): string | null {
+  if (!element) return null;
+  // Text colour inherits, so walk up until an ancestor actually declares one.
+  let current = element;
+  for (let depth = 0; depth < 6 && current.length > 0; depth++) {
+    const color = firstColor(computeStyle($, current, rules), ["color"]);
+    if (isVisibleColor(color)) return color;
+    current = current.parent();
+  }
+  return null;
 }
 
 function isButtonSelector(selector: string): boolean {
@@ -509,12 +726,13 @@ function deriveComponents(
   $: cheerio.CheerioAPI,
   rules: StyleRule[],
   buttons: cheerio.Cheerio<AnyNode>[],
+  fallback: string,
 ): BrandKit["components"] {
   const styles: ButtonStyle[] = [];
   const seen = new Set<string>();
 
   for (const button of buttons) {
-    const style = toButtonStyle(computeStyle($, button, rules));
+    const style = toButtonStyle(computeStyle($, button, rules), fallback);
     if (!style) continue;
     const signature = JSON.stringify(style);
     if (seen.has(signature)) continue; // visually identical — not a distinct button
@@ -523,22 +741,47 @@ function deriveComponents(
     if (styles.length === 2) break;
   }
 
-  return { buttonPrimary: styles[0] ?? null, buttonSecondary: styles[1] ?? null };
+  // A page with no buttons still gets fully-populated components rather than nulls.
+  const blank = defaultButtonStyle(fallback);
+  return { buttonPrimary: styles[0] ?? blank, buttonSecondary: styles[1] ?? blank };
 }
 
-function toButtonStyle(style: Map<string, string>): ButtonStyle | null {
-  // A fully transparent value describes no colour, so report it as null rather than "rgba(0, 0, 0, 0)".
+function defaultButtonStyle(fallback: string): ButtonStyle {
+  return {
+    background: fallback,
+    textColor: fallback,
+    borderColor: DEFAULT_BUTTON_BORDER,
+    borderRadius: DEFAULT_BUTTON_RADIUS,
+    shadow: DEFAULT_BUTTON_SHADOW,
+  };
+}
+
+/**
+ * Read a button's style, substituting CSS initial values for anything absent so no
+ * field is ever null: no border reads as "transparent", no rounding as "0px", and
+ * no shadow as "none". A fully transparent colour describes nothing, so it counts
+ * as absent rather than being reported as "rgba(0, 0, 0, 0)".
+ */
+function toButtonStyle(style: Map<string, string>, fallback: string): ButtonStyle | null {
   const opaque = (color: string | null) => (isVisibleColor(color) ? color : null);
 
-  const result: ButtonStyle = {
+  const derived = {
     background: opaque(firstColor(style, ["background-color", "background"])),
     textColor: opaque(firstColor(style, ["color"])),
     borderColor: opaque(firstColor(style, ["border-color", "border-top-color", "border"])),
     borderRadius: style.get("border-radius")?.trim() ?? null,
     shadow: normalizeShadow(style.get("box-shadow")),
   };
-  // An element we derived nothing for isn't worth reporting as a component.
-  return Object.values(result).some((value) => value !== null) ? result : null;
+  // An element we derived nothing for isn't a button worth reporting.
+  if (Object.values(derived).every((value) => value === null)) return null;
+
+  return {
+    background: derived.background ?? fallback,
+    textColor: derived.textColor ?? fallback,
+    borderColor: derived.borderColor ?? DEFAULT_BUTTON_BORDER,
+    borderRadius: derived.borderRadius ?? DEFAULT_BUTTON_RADIUS,
+    shadow: derived.shadow ?? DEFAULT_BUTTON_SHADOW,
+  };
 }
 
 /**
